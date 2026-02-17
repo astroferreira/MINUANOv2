@@ -9,6 +9,7 @@ runs MFMTK on each cutout, and writes a source-level CSV catalog.
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
 import os
 import signal
@@ -16,6 +17,7 @@ import time
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -240,6 +242,70 @@ def parse_args() -> argparse.Namespace:
         default=60.0,
         help="Seconds between heartbeat logs while waiting on futures",
     )
+
+    parser.add_argument(
+        "--exclude-gaia-stars",
+        action="store_true",
+        help="Exclude Gaia-star areas from source detection.",
+    )
+    parser.add_argument(
+        "--gaia-stars-csv",
+        default="",
+        help="Optional Gaia CSV (e.g., from identify-gaia-stars.py). If empty, query Gaia and cache it.",
+    )
+    parser.add_argument(
+        "--gaia-cache-csv",
+        default="",
+        help="Output CSV for Gaia auto-query (default: <output_dir>/gaia_stars_in_field.csv).",
+    )
+    parser.add_argument(
+        "--gaia-table",
+        default="gaiadr3.gaia_source",
+        help="Gaia table for ADQL query when auto-query is enabled.",
+    )
+    parser.add_argument(
+        "--gaia-row-limit",
+        type=int,
+        default=200000,
+        help="Gaia query row limit.",
+    )
+    parser.add_argument(
+        "--gaia-mag-limit",
+        type=float,
+        default=None,
+        help="Optional magnitude cut (phot_g_mean_mag <= value).",
+    )
+    parser.add_argument("--gaia-ra-col", default="ra", help="RA column name in Gaia CSV.")
+    parser.add_argument("--gaia-dec-col", default="dec", help="Dec column name in Gaia CSV.")
+    parser.add_argument(
+        "--gaia-mag-col",
+        default="phot_g_mean_mag",
+        help="Magnitude column name in Gaia CSV.",
+    )
+    parser.add_argument(
+        "--gaia-r0",
+        type=float,
+        default=8.0,
+        help="Gaia mask radius (arcsec) at reference magnitude mag0.",
+    )
+    parser.add_argument(
+        "--gaia-mag0",
+        type=float,
+        default=15.0,
+        help="Reference magnitude for Gaia mask radius scaling.",
+    )
+    parser.add_argument(
+        "--gaia-minr",
+        type=float,
+        default=1.0,
+        help="Minimum Gaia mask radius in arcsec.",
+    )
+    parser.add_argument(
+        "--gaia-maxr",
+        type=float,
+        default=40.0,
+        help="Maximum Gaia mask radius in arcsec.",
+    )
     return parser.parse_args()
 
 
@@ -260,6 +326,219 @@ def _normalize_metric_name(name: str) -> str:
     if name.startswith(("P_", "S_")):
         return name[2:]
     return name
+
+
+def _supports_kwarg(fn, kwarg_name: str) -> bool:
+    try:
+        return kwarg_name in inspect.signature(fn).parameters
+    except Exception:
+        return False
+
+
+def _footprint_polygon_icrs(wcs: WCS, nx: int, ny: int) -> np.ndarray:
+    try:
+        fp = wcs.calc_footprint(axes=(nx, ny))
+        return np.asarray(fp, dtype=float)
+    except Exception:
+        corners = np.array(
+            [
+                [0, 0],
+                [nx - 1, 0],
+                [nx - 1, ny - 1],
+                [0, ny - 1],
+            ],
+            dtype=float,
+        )
+        ra, dec = wcs.pixel_to_world_values(corners[:, 0], corners[:, 1])
+        return np.column_stack((np.asarray(ra, dtype=float), np.asarray(dec, dtype=float)))
+
+
+def _build_gaia_adql_query(
+    fp_deg: np.ndarray,
+    table: str,
+    mag_limit: float | None,
+) -> str:
+    coords = ", ".join([f"{ra:.12f}, {dec:.12f}" for ra, dec in fp_deg])
+    poly = f"POLYGON('ICRS', {coords})"
+    where = f"CONTAINS(POINT('ICRS', ra, dec), {poly}) = 1"
+    if mag_limit is not None:
+        where += f" AND phot_g_mean_mag <= {float(mag_limit)}"
+    return (
+        "SELECT source_id, ra, dec, phot_g_mean_mag "
+        f"FROM {table} "
+        f"WHERE {where}"
+    )
+
+
+def _query_gaia_catalog(
+    wcs: WCS,
+    nx: int,
+    ny: int,
+    args: argparse.Namespace,
+) -> pd.DataFrame:
+    try:
+        from astroquery.gaia import Gaia
+    except ImportError as exc:
+        raise RuntimeError(
+            "astroquery is required for Gaia auto-query. Install astroquery or provide --gaia-stars-csv."
+        ) from exc
+
+    fp = _footprint_polygon_icrs(wcs, nx, ny)
+    query = _build_gaia_adql_query(fp, str(args.gaia_table), args.gaia_mag_limit)
+    Gaia.ROW_LIMIT = int(args.gaia_row_limit)
+    debug_log("gaia_query_start row_limit=%d", int(args.gaia_row_limit))
+    job = Gaia.launch_job_async(query)
+    tab = job.get_results()
+    if len(tab) == 0:
+        return pd.DataFrame(
+            columns=["source_id", "ra", "dec", "phot_g_mean_mag"],
+            dtype=float,
+        )
+    df = tab.to_pandas()
+    keep_cols = [c for c in ("source_id", "ra", "dec", "phot_g_mean_mag") if c in df.columns]
+    return df[keep_cols].copy()
+
+
+@lru_cache(maxsize=8)
+def _read_gaia_catalog_csv(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
+def _sanitize_gaia_catalog(
+    df: pd.DataFrame,
+    args: argparse.Namespace,
+) -> pd.DataFrame:
+    ra_col = str(args.gaia_ra_col)
+    dec_col = str(args.gaia_dec_col)
+    mag_col = str(args.gaia_mag_col)
+    required = [ra_col, dec_col]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Gaia CSV is missing required column(s): {missing}")
+
+    out = pd.DataFrame(
+        {
+            "ra": pd.to_numeric(df[ra_col], errors="coerce"),
+            "dec": pd.to_numeric(df[dec_col], errors="coerce"),
+        }
+    )
+    has_mag_col = mag_col in df.columns
+    if has_mag_col:
+        out["phot_g_mean_mag"] = pd.to_numeric(df[mag_col], errors="coerce")
+    else:
+        out["phot_g_mean_mag"] = np.nan
+
+    keep = np.isfinite(out["ra"].to_numpy()) & np.isfinite(out["dec"].to_numpy())
+    out = out.loc[keep].reset_index(drop=True)
+    if args.gaia_mag_limit is not None and has_mag_col:
+        mag = out["phot_g_mean_mag"].to_numpy()
+        keep_mag = np.isfinite(mag) & (mag <= float(args.gaia_mag_limit))
+        out = out.loc[keep_mag].reset_index(drop=True)
+    return out
+
+
+def _load_gaia_catalog_from_args(args: argparse.Namespace) -> pd.DataFrame:
+    path = Path(str(args.gaia_stars_csv)).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Gaia CSV not found: {path}")
+    raw = _read_gaia_catalog_csv(str(path))
+    return _sanitize_gaia_catalog(raw, args)
+
+
+def _mag_to_radius_arcsec(
+    mag: np.ndarray,
+    r0: float,
+    mag0: float,
+    min_r: float,
+    max_r: float,
+) -> np.ndarray:
+    m = np.asarray(mag, dtype=float)
+    r = float(r0) * (10.0 ** (-0.2 * (m - float(mag0))))
+    r = np.clip(r, float(min_r), float(max_r))
+    if not np.all(np.isfinite(r)):
+        r = np.where(np.isfinite(r), r, float(r0))
+    return r
+
+
+def _build_gaia_exclusion_mask(
+    shape: tuple[int, int],
+    wcs: WCS,
+    pixscale_arcsec: float,
+    gaia_catalog: pd.DataFrame,
+    args: argparse.Namespace,
+) -> np.ndarray | None:
+    if gaia_catalog.empty:
+        return None
+
+    ny, nx = int(shape[0]), int(shape[1])
+    ra = gaia_catalog["ra"].to_numpy(dtype=float)
+    dec = gaia_catalog["dec"].to_numpy(dtype=float)
+    mag = gaia_catalog["phot_g_mean_mag"].to_numpy(dtype=float)
+
+    x, y = wcs.world_to_pixel_values(ra, dec)
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    radii_arcsec = _mag_to_radius_arcsec(
+        mag,
+        r0=float(args.gaia_r0),
+        mag0=float(args.gaia_mag0),
+        min_r=float(args.gaia_minr),
+        max_r=float(args.gaia_maxr),
+    )
+    pixscale = max(float(pixscale_arcsec), 1.0e-9)
+    radii_pix = radii_arcsec / pixscale
+
+    mask = np.zeros((ny, nx), dtype=bool)
+    for cx, cy, rr in zip(x, y, radii_pix):
+        if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(rr) and rr > 0):
+            continue
+
+        x0 = max(0, int(np.floor(cx - rr)))
+        x1 = min(nx, int(np.ceil(cx + rr)) + 1)
+        y0 = max(0, int(np.floor(cy - rr)))
+        y1 = min(ny, int(np.ceil(cy + rr)) + 1)
+        if x0 >= x1 or y0 >= y1:
+            continue
+
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        circle = (xx - cx) ** 2 + (yy - cy) ** 2 <= rr**2
+        mask[y0:y1, x0:x1] |= circle
+
+    if not np.any(mask):
+        return None
+    return mask
+
+
+def _prepare_gaia_catalog_if_needed(
+    args: argparse.Namespace,
+    wcs: WCS,
+    nx: int,
+    ny: int,
+    output_dir: Path,
+) -> None:
+    if not args.exclude_gaia_stars:
+        return
+
+    if str(args.gaia_stars_csv).strip():
+        args.gaia_stars_csv = str(Path(str(args.gaia_stars_csv)).expanduser().resolve())
+        gaia_df = _load_gaia_catalog_from_args(args)
+        debug_log("gaia_catalog_loaded path=%s rows=%d", args.gaia_stars_csv, int(len(gaia_df)))
+        print(f"Using Gaia catalog: {args.gaia_stars_csv} ({len(gaia_df)} rows)")
+        return
+
+    gaia_df = _query_gaia_catalog(wcs, nx, ny, args)
+    cache_path = (
+        Path(str(args.gaia_cache_csv)).expanduser()
+        if str(args.gaia_cache_csv).strip()
+        else (output_dir / "gaia_stars_in_field.csv")
+    )
+    cache_path = cache_path.resolve()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    gaia_df.to_csv(cache_path, index=False)
+    args.gaia_stars_csv = str(cache_path)
+    debug_log("gaia_catalog_queried path=%s rows=%d", cache_path, int(len(gaia_df)))
+    print(f"Wrote Gaia catalog: {cache_path} ({len(gaia_df)} rows)")
 
 
 def extract_scalar_metrics(obj, skip: set[str] | None = None) -> dict[str, float]:
@@ -566,16 +845,53 @@ def _run_pipeline_on_data(
 
     kernel = Gaussian2DKernel(x_stddev=args.kernel_fwhm / 2.355)
     smooth = convolve(data_sub, kernel, normalize_kernel=True)
-    segm = detect_sources(smooth, threshold, npixels=args.npixels)
+
+    gaia_mask = None
+    if args.exclude_gaia_stars:
+        gaia_catalog = _load_gaia_catalog_from_args(args)
+        gaia_mask = _build_gaia_exclusion_mask(
+            data.shape,
+            wcs,
+            pixscale_arcsec,
+            gaia_catalog,
+            args,
+        )
+        if gaia_mask is not None:
+            masked_px = int(np.count_nonzero(gaia_mask))
+            debug_log(
+                "gaia_mask context=%s stars=%d masked_pixels=%d frac=%.4f",
+                context,
+                int(len(gaia_catalog)),
+                masked_px,
+                float(masked_px / gaia_mask.size),
+            )
+
+    detect_kwargs = {}
+    if gaia_mask is not None and _supports_kwarg(detect_sources, "mask"):
+        detect_kwargs["mask"] = gaia_mask
+        segm = detect_sources(smooth, threshold, npixels=args.npixels, **detect_kwargs)
+    elif gaia_mask is not None:
+        smooth_for_detection = np.array(smooth, copy=True)
+        threshold_for_detection = np.array(threshold, copy=True)
+        smooth_for_detection[gaia_mask] = 0.0
+        threshold_for_detection[gaia_mask] = np.inf
+        segm = detect_sources(smooth_for_detection, threshold_for_detection, npixels=args.npixels)
+    else:
+        segm = detect_sources(smooth, threshold, npixels=args.npixels)
+
     if segm is None:
         raise RuntimeError("No sources detected.")
     if args.deblend:
+        deblend_kwargs = {}
+        if gaia_mask is not None and _supports_kwarg(deblend_sources, "mask"):
+            deblend_kwargs["mask"] = gaia_mask
         segm = deblend_sources(
             smooth,
             segm,
             npixels=args.npixels,
             nlevels=args.deblend_nlevels,
             contrast=args.deblend_contrast,
+            **deblend_kwargs,
         )
 
     cat = SourceCatalog(data_sub, segm, wcs=wcs, error=err_map)
@@ -777,7 +1093,12 @@ def main() -> None:
             lazy_load_hdus=True,
             do_not_scale_image_data=args.no_scale,
         ) as hdul:
-            height, width = hdul[args.sci_ext].shape
+            sci_hdu = hdul[args.sci_ext]
+            height, width = sci_hdu.shape
+            wcs_full = WCS(sci_hdu.header)
+
+        if args.exclude_gaia_stars:
+            _prepare_gaia_catalog_if_needed(args, wcs_full, width, height, output_path.parent)
 
         nrows, ncols = _choose_tile_grid(width, height, args.tile_max)
         tiles = _build_tiles(width, height, nrows, ncols, max(0, int(args.tile_overlap)))
@@ -880,6 +1201,15 @@ def main() -> None:
             data = sci_hdu.data
             wcs = wcs_full
             err_map = _load_error_map(hdul, args, slice(0, height), slice(0, width))
+
+    if args.exclude_gaia_stars:
+        _prepare_gaia_catalog_if_needed(
+            args,
+            wcs,
+            int(data.shape[1]),
+            int(data.shape[0]),
+            output_path.parent,
+        )
 
     tmp_dir = output_path.parent / "tmp_mfmtk"
     df = _run_pipeline_on_data(data, wcs, err_map, args, tmp_dir, context="mosaic")
