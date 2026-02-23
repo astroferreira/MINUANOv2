@@ -12,7 +12,10 @@ import argparse
 import inspect
 import logging
 import os
+import re
+import shutil
 import signal
+import subprocess
 import time
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
@@ -28,11 +31,20 @@ from astropy.nddata import Cutout2D
 from astropy.stats import SigmaClip
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
-from photutils.background import Background2D, MedianBackground
-from photutils.segmentation import SourceCatalog, deblend_sources, detect_sources
 from tqdm import tqdm
 
+from gaia_mask_utils import build_gaia_exclusion_mask as _build_gaia_exclusion_mask
 from mfmtk import Photometry, Stamp, config as mfmtk_config
+
+try:
+    from photutils.background import Background2D, MedianBackground
+    from photutils.segmentation import SourceCatalog, deblend_sources, detect_sources
+except Exception:  # pragma: no cover - optional when using SExtractor mode
+    Background2D = None
+    MedianBackground = None
+    SourceCatalog = None
+    deblend_sources = None
+    detect_sources = None
 
 warnings.filterwarnings("ignore")
 mfmtk_config.verbose = 0
@@ -41,6 +53,8 @@ ERROR_LOG_PATH = Path("err.log")
 DEBUG_LOG_PATH = Path("debug.log")
 DEBUG_ENABLED = False
 DEBUG_HEARTBEAT_SECONDS = 60.0
+FILTER_TOKEN_RE = re.compile(r"^F\d{3,4}[A-Z0-9]*$", re.IGNORECASE)
+FIELD_VERSION_SUFFIX_RE = re.compile(r"v\d+$", re.IGNORECASE)
 
 
 class MfmtkTimeoutError(Exception):
@@ -142,6 +156,39 @@ def parse_args() -> argparse.Namespace:
         help="Output CSV path",
     )
     parser.add_argument("--psf", default="psf/jwst_psf_f444w.fits", help="MFMTK PSF FITS")
+    parser.add_argument(
+        "--detection-engine",
+        choices=("sextractor", "photutils"),
+        default="sextractor",
+        help="Detection/catalog engine (default: sextractor).",
+    )
+    parser.add_argument(
+        "--sextractor-bin",
+        default="",
+        help="Path to SExtractor executable (source-extractor/sex/sextractor).",
+    )
+    parser.add_argument(
+        "--detect-stack-inputs",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional FITS mosaics to stack for detection (dual-image mode). "
+            "If omitted, siblings in the same directory are auto-discovered by field."
+        ),
+    )
+    parser.add_argument(
+        "--detect-stack-filters",
+        dest="detect_stack_filters",
+        action="store_true",
+        default=True,
+        help="Auto-stack same-field filter mosaics for detection (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-detect-stack-filters",
+        dest="detect_stack_filters",
+        action="store_false",
+        help="Disable multi-filter stacked detection; detect on --input only.",
+    )
 
     parser.add_argument("--nsigma", type=float, default=2.5, help="Detection sigma threshold")
     parser.add_argument("--npixels", type=int, default=50, help="Minimum connected pixels")
@@ -245,8 +292,16 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--exclude-gaia-stars",
+        dest="exclude_gaia_stars",
         action="store_true",
-        help="Exclude Gaia-star areas from source detection.",
+        default=True,
+        help="Exclude Gaia-star areas from source detection (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-exclude-gaia-stars",
+        dest="exclude_gaia_stars",
+        action="store_false",
+        help="Disable Gaia-star exclusion masking.",
     )
     parser.add_argument(
         "--gaia-stars-csv",
@@ -306,6 +361,33 @@ def parse_args() -> argparse.Namespace:
         default=40.0,
         help="Maximum Gaia mask radius in arcsec.",
     )
+    parser.add_argument(
+        "--gaia-mask-shape",
+        choices=("star12", "star8", "star4", "jwst", "circle"),
+        default="star12",
+        help=(
+            "Gaia exclusion mask shape (default: star12 core+arms every 30 deg; "
+            "'jwst' keeps the older hex+6-spike template)."
+        ),
+    )
+    parser.add_argument(
+        "--gaia-mask-rotation-deg",
+        type=float,
+        default=0.0,
+        help="Rotation angle (deg) for JWST Gaia mask template.",
+    )
+    parser.add_argument(
+        "--gaia-mask-xshift-pix",
+        type=float,
+        default=0.0,
+        help="Global Gaia mask X shift in pixels (positive shifts mask right).",
+    )
+    parser.add_argument(
+        "--gaia-mask-yshift-pix",
+        type=float,
+        default=0.0,
+        help="Global Gaia mask Y shift in pixels (positive shifts mask up).",
+    )
     return parser.parse_args()
 
 
@@ -333,6 +415,93 @@ def _supports_kwarg(fn, kwarg_name: str) -> bool:
         return kwarg_name in inspect.signature(fn).parameters
     except Exception:
         return False
+
+
+def _extract_filter_and_field_token(path: Path) -> tuple[str | None, str | None]:
+    stem = path.name
+    if stem.endswith(".fits.gz"):
+        stem = stem[:-8]
+    elif stem.endswith(".fits"):
+        stem = stem[:-5]
+
+    prefix = stem.split("_", 1)[0]
+    parts = [p for p in prefix.split("-") if p]
+    for i, part in enumerate(parts):
+        if FILTER_TOKEN_RE.fullmatch(part):
+            field_token = parts[i + 1] if (i + 1) < len(parts) else None
+            return part.upper(), field_token
+    return None, None
+
+
+def _normalize_field_token(field_token: str | None) -> str:
+    if not field_token:
+        return ""
+    return FIELD_VERSION_SUFFIX_RE.sub("", str(field_token).strip()).upper()
+
+
+def _looks_like_fits(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(".fits") or name.endswith(".fits.gz")
+
+
+def _resolve_detection_stack_paths(
+    input_path: Path,
+    args: argparse.Namespace,
+) -> list[Path]:
+    input_path = input_path.expanduser().resolve()
+
+    explicit = getattr(args, "detect_stack_inputs", None)
+    if explicit:
+        ordered: list[Path] = [input_path]
+        seen = {input_path}
+        for item in explicit:
+            p = Path(str(item)).expanduser().resolve()
+            if p == input_path or p in seen:
+                continue
+            if not p.exists():
+                raise FileNotFoundError(f"Detection stack input not found: {p}")
+            ordered.append(p)
+            seen.add(p)
+        debug_log("detect_stack_explicit n=%d", int(len(ordered)))
+        return ordered
+
+    if not bool(getattr(args, "detect_stack_filters", True)):
+        return [input_path]
+
+    in_filter, in_field = _extract_filter_and_field_token(input_path)
+    norm_field = _normalize_field_token(in_field)
+    if not in_filter or not norm_field:
+        debug_log("detect_stack_auto_skip reason=filename_parse_failed input=%s", input_path.name)
+        return [input_path]
+
+    parent = input_path.parent
+    candidates: list[Path] = []
+    for p in sorted(parent.iterdir()):
+        if not p.is_file() or not _looks_like_fits(p):
+            continue
+        filt, field = _extract_filter_and_field_token(p)
+        if not filt:
+            continue
+        if _normalize_field_token(field) != norm_field:
+            continue
+        candidates.append(p.resolve())
+
+    # Keep deterministic order and ensure the measurement image is first.
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for p in [input_path, *candidates]:
+        if p in seen:
+            continue
+        unique.append(p)
+        seen.add(p)
+
+    debug_log(
+        "detect_stack_auto input=%s field=%s n_candidates=%d",
+        input_path.name,
+        norm_field,
+        int(len(unique)),
+    )
+    return unique or [input_path]
 
 
 def _footprint_polygon_icrs(wcs: WCS, nx: int, ny: int) -> np.ndarray:
@@ -443,71 +612,6 @@ def _load_gaia_catalog_from_args(args: argparse.Namespace) -> pd.DataFrame:
         raise FileNotFoundError(f"Gaia CSV not found: {path}")
     raw = _read_gaia_catalog_csv(str(path))
     return _sanitize_gaia_catalog(raw, args)
-
-
-def _mag_to_radius_arcsec(
-    mag: np.ndarray,
-    r0: float,
-    mag0: float,
-    min_r: float,
-    max_r: float,
-) -> np.ndarray:
-    m = np.asarray(mag, dtype=float)
-    r = float(r0) * (10.0 ** (-0.2 * (m - float(mag0))))
-    r = np.clip(r, float(min_r), float(max_r))
-    if not np.all(np.isfinite(r)):
-        r = np.where(np.isfinite(r), r, float(r0))
-    return r
-
-
-def _build_gaia_exclusion_mask(
-    shape: tuple[int, int],
-    wcs: WCS,
-    pixscale_arcsec: float,
-    gaia_catalog: pd.DataFrame,
-    args: argparse.Namespace,
-) -> np.ndarray | None:
-    if gaia_catalog.empty:
-        return None
-
-    ny, nx = int(shape[0]), int(shape[1])
-    ra = gaia_catalog["ra"].to_numpy(dtype=float)
-    dec = gaia_catalog["dec"].to_numpy(dtype=float)
-    mag = gaia_catalog["phot_g_mean_mag"].to_numpy(dtype=float)
-
-    x, y = wcs.world_to_pixel_values(ra, dec)
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-
-    radii_arcsec = _mag_to_radius_arcsec(
-        mag,
-        r0=float(args.gaia_r0),
-        mag0=float(args.gaia_mag0),
-        min_r=float(args.gaia_minr),
-        max_r=float(args.gaia_maxr),
-    )
-    pixscale = max(float(pixscale_arcsec), 1.0e-9)
-    radii_pix = radii_arcsec / pixscale
-
-    mask = np.zeros((ny, nx), dtype=bool)
-    for cx, cy, rr in zip(x, y, radii_pix):
-        if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(rr) and rr > 0):
-            continue
-
-        x0 = max(0, int(np.floor(cx - rr)))
-        x1 = min(nx, int(np.ceil(cx + rr)) + 1)
-        y0 = max(0, int(np.floor(cy - rr)))
-        y1 = min(ny, int(np.ceil(cy + rr)) + 1)
-        if x0 >= x1 or y0 >= y1:
-            continue
-
-        yy, xx = np.ogrid[y0:y1, x0:x1]
-        circle = (xx - cx) ** 2 + (yy - cy) ** 2 <= rr**2
-        mask[y0:y1, x0:x1] |= circle
-
-    if not np.any(mask):
-        return None
-    return mask
 
 
 def _prepare_gaia_catalog_if_needed(
@@ -702,6 +806,336 @@ def _load_error_map(
     return err_map
 
 
+def _load_sci_data_slice(
+    fits_path: Path,
+    args: argparse.Namespace,
+    y_slice: slice,
+    x_slice: slice,
+) -> np.ndarray:
+    with fits.open(
+        fits_path,
+        memmap=True,
+        mode="readonly",
+        lazy_load_hdus=True,
+        do_not_scale_image_data=args.no_scale,
+    ) as hdul:
+        if args.sci_ext not in hdul:
+            raise KeyError(f"SCI extension '{args.sci_ext}' not found in {fits_path}")
+        sci_hdu = hdul[args.sci_ext]
+        if sci_hdu.data is None:
+            raise RuntimeError(f"SCI extension '{args.sci_ext}' has no data in {fits_path}")
+        arr = sci_hdu.section[y_slice, x_slice]
+    return np.array(arr, dtype=np.float32, copy=True)
+
+
+def _build_detection_stack_for_region(
+    stack_paths: list[Path],
+    args: argparse.Namespace,
+    y_slice: slice,
+    x_slice: slice,
+    context: str,
+) -> tuple[np.ndarray | None, list[Path]]:
+    if len(stack_paths) <= 1:
+        return None, []
+
+    sum_img: np.ndarray | None = None
+    count_img: np.ndarray | None = None
+    used_paths: list[Path] = []
+
+    for p in stack_paths:
+        try:
+            img = _load_sci_data_slice(p, args, y_slice, x_slice)
+        except Exception as exc:
+            debug_exception("detect_stack_read_failed context=%s path=%s err=%s", context, p, exc)
+            continue
+
+        if sum_img is None:
+            sum_img = np.zeros_like(img, dtype=np.float32)
+            count_img = np.zeros_like(img, dtype=np.uint16)
+        elif img.shape != sum_img.shape:
+            debug_log(
+                "detect_stack_skip_shape context=%s path=%s shape=%s expected=%s",
+                context,
+                p,
+                tuple(img.shape),
+                tuple(sum_img.shape),
+            )
+            continue
+
+        finite = np.isfinite(img)
+        if not np.any(finite):
+            debug_log("detect_stack_skip_allnan context=%s path=%s", context, p)
+            continue
+
+        sum_img[finite] += img[finite]
+        count_img[finite] += 1
+        used_paths.append(p)
+
+    if sum_img is None or count_img is None or len(used_paths) <= 1:
+        return None, used_paths
+
+    det_img = np.zeros_like(sum_img, dtype=np.float32)
+    good = count_img > 0
+    det_img[good] = sum_img[good] / count_img[good]
+
+    debug_log(
+        "detect_stack_built context=%s n_inputs=%d shape=%dx%d",
+        context,
+        int(len(used_paths)),
+        int(det_img.shape[0]),
+        int(det_img.shape[1]),
+    )
+    return det_img, used_paths
+
+
+def _resolve_sextractor_binary(args: argparse.Namespace) -> str:
+    explicit = str(getattr(args, "sextractor_bin", "")).strip()
+    if explicit:
+        return explicit
+    for name in ("source-extractor", "sex", "sextractor"):
+        found = shutil.which(name)
+        if found:
+            return found
+    raise RuntimeError(
+        "SExtractor executable not found. Install 'source-extractor' (or 'sex') "
+        "or pass --sextractor-bin /path/to/binary."
+    )
+
+
+def _write_fits_image(path: Path, data: np.ndarray, wcs: WCS | None = None) -> None:
+    header = wcs.to_header() if wcs is not None else None
+    fits.PrimaryHDU(np.asarray(data), header=header).writeto(path, overwrite=True)
+
+
+def _gaia_mask_export_path(tmp_dir: Path, context: str) -> Path:
+    # For mosaic runs, save beside the final output directory (parent of tmp_mfmtk).
+    # For tile runs, save within the tile temp directory to avoid clutter/collisions.
+    if context == "mosaic":
+        return tmp_dir.parent / "gaia_mask_mosaic.fits"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(context))
+    return tmp_dir / f"gaia_mask_{safe}.fits"
+
+
+def _export_gaia_mask_fits(
+    mask: np.ndarray | None,
+    wcs: WCS,
+    tmp_dir: Path,
+    context: str,
+) -> Path | None:
+    if mask is None:
+        return None
+    path = _gaia_mask_export_path(tmp_dir, context)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_fits_image(path, mask.astype(np.uint8), wcs=wcs)
+    debug_log("gaia_mask_fits_written context=%s path=%s", context, path)
+    return path
+
+
+def _sextractor_gaussian_kernel(size: int, sigma_pix: float) -> np.ndarray:
+    size = max(3, int(size))
+    if size % 2 == 0:
+        size += 1
+    sigma = max(float(sigma_pix), 1.0e-3)
+    c = size // 2
+    yy, xx = np.mgrid[-c : c + 1, -c : c + 1]
+    kern = np.exp(-(xx**2 + yy**2) / (2.0 * sigma * sigma))
+    if np.sum(kern) <= 0:
+        kern[c, c] = 1.0
+    return kern / np.sum(kern)
+
+
+def _write_sextractor_conv_file(path: Path, args: argparse.Namespace) -> None:
+    sigma_pix = max(float(args.kernel_fwhm) / 2.355, 0.5)
+    size = int(np.ceil(6.0 * sigma_pix))
+    if size % 2 == 0:
+        size += 1
+    size = max(3, size)
+    kern = _sextractor_gaussian_kernel(size, sigma_pix)
+    lines = ["CONV NORM", f"# {size}x{size} Gaussian kernel (generated)"]
+    for row in kern:
+        lines.append(" ".join([f"{float(v):.8f}" for v in row]))
+    path.write_text("\n".join(lines) + "\n", encoding="ascii")
+
+
+def _write_sextractor_params_file(path: Path) -> None:
+    # Minimal columns to mirror the photutils-based downstream expectations.
+    params = [
+        "NUMBER",
+        "X_IMAGE",
+        "Y_IMAGE",
+        "A_IMAGE",
+        "B_IMAGE",
+        "KRON_RADIUS",
+        "FLUX_ISO",
+        "ISOAREA_IMAGE",
+        "ALPHA_J2000",
+        "DELTA_J2000",
+        "FLAGS",
+        "IMAFLAGS_ISO",
+    ]
+    path.write_text("\n".join(params) + "\n", encoding="ascii")
+
+
+def _read_sextractor_fits_catalog(path: Path) -> fits.FITS_rec:
+    with fits.open(path, memmap=False) as hdul:
+        for hdu in hdul:
+            if isinstance(hdu, fits.BinTableHDU) and hdu.data is not None:
+                return hdu.data.copy()
+    raise RuntimeError(f"SExtractor catalog has no binary table HDU: {path}")
+
+
+def _sextractor_dual_image_catalog(
+    data: np.ndarray,
+    detect_data: np.ndarray,
+    wcs: WCS,
+    gaia_mask: np.ndarray | None,
+    args: argparse.Namespace,
+    tmp_dir: Path,
+    context: str,
+) -> dict[str, np.ndarray]:
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    sex_bin = _resolve_sextractor_binary(args)
+
+    # Export binary mask FITS for QA/reuse and also use it as FLAG_IMAGE for SExtractor.
+    gaia_mask_path = _export_gaia_mask_fits(gaia_mask, wcs, tmp_dir, context)
+
+    det_arr = np.array(detect_data, dtype=np.float32, copy=True)
+    meas_arr = np.array(data, dtype=np.float32, copy=True)
+    if gaia_mask is not None and gaia_mask.shape == det_arr.shape:
+        for arr in (det_arr, meas_arr):
+            finite = np.isfinite(arr)
+            fill = float(np.nanmedian(arr[finite])) if np.any(finite) else 0.0
+            arr[gaia_mask] = fill
+
+    det_path = tmp_dir / "sex_detect.fits"
+    meas_path = tmp_dir / "sex_measure.fits"
+    cat_path = tmp_dir / "sex_catalog.fits"
+    conv_path = tmp_dir / "sex.conv"
+    params_path = tmp_dir / "sex.params"
+
+    _write_fits_image(det_path, det_arr, wcs=wcs)
+    _write_fits_image(meas_path, meas_arr, wcs=wcs)
+    _write_sextractor_conv_file(conv_path, args)
+    _write_sextractor_params_file(params_path)
+
+    deblend_nthresh = int(args.deblend_nlevels) if bool(args.deblend) else 1
+    deblend_mincont = float(args.deblend_contrast) if bool(args.deblend) else 1.0
+
+    cmd = [
+        sex_bin,
+        f"{det_path},{meas_path}",
+        "-CATALOG_NAME",
+        str(cat_path),
+        "-CATALOG_TYPE",
+        "FITS_1.0",
+        "-PARAMETERS_NAME",
+        str(params_path),
+        "-DETECT_MINAREA",
+        str(int(args.npixels)),
+        "-DETECT_THRESH",
+        str(float(args.nsigma)),
+        "-ANALYSIS_THRESH",
+        str(float(args.nsigma)),
+        "-THRESH_TYPE",
+        "RELATIVE",
+        "-FILTER",
+        "Y",
+        "-FILTER_NAME",
+        str(conv_path),
+        "-BACK_SIZE",
+        str(int(args.box_size)),
+        "-BACK_FILTERSIZE",
+        str(int(args.filter_size)),
+        "-DEBLEND_NTHRESH",
+        str(max(1, deblend_nthresh)),
+        "-DEBLEND_MINCONT",
+        str(float(deblend_mincont)),
+        "-VERBOSE_TYPE",
+        "QUIET",
+        "-CHECKIMAGE_TYPE",
+        "NONE",
+    ]
+    if gaia_mask_path is not None:
+        cmd.extend(["-FLAG_IMAGE", str(gaia_mask_path), "-FLAG_TYPE", "OR"])
+
+    debug_log("sextractor_start context=%s cmd=%s", context, " ".join(cmd))
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "SExtractor failed "
+            f"(exit={proc.returncode}) for {context}: "
+            f"{(proc.stderr or proc.stdout or '').strip()}"
+        )
+
+    rec = _read_sextractor_fits_catalog(cat_path)
+    if rec is None or len(rec) == 0:
+        raise RuntimeError("No sources detected.")
+
+    names = {str(n).upper(): str(n) for n in rec.dtype.names or ()}
+
+    def col(name: str, default=None):
+        key = names.get(name.upper())
+        if key is None:
+            return default
+        return np.asarray(rec[key])
+
+    x_image = np.asarray(col("X_IMAGE", np.array([], dtype=float)), dtype=float)
+    y_image = np.asarray(col("Y_IMAGE", np.array([], dtype=float)), dtype=float)
+    if x_image.size == 0:
+        raise RuntimeError("SExtractor catalog missing X_IMAGE/Y_IMAGE.")
+
+    # SExtractor image coordinates are 1-based; convert to numpy 0-based pixel coords.
+    x_arr = x_image - 1.0
+    y_arr = y_image - 1.0
+    sma_arr = np.asarray(col("A_IMAGE", np.full_like(x_arr, np.nan)), dtype=float)
+    smi_arr = np.asarray(col("B_IMAGE", np.full_like(x_arr, np.nan)), dtype=float)
+    kron_arr = np.asarray(col("KRON_RADIUS", np.full_like(x_arr, np.nan)), dtype=float)
+    seg_flux_arr = np.asarray(col("FLUX_ISO", np.full_like(x_arr, np.nan)), dtype=float)
+    seg_area_arr = np.asarray(col("ISOAREA_IMAGE", np.full_like(x_arr, np.nan)), dtype=float)
+    sex_flags_arr = np.asarray(col("FLAGS", np.zeros_like(x_arr)), dtype=float)
+    imaflags_arr = np.asarray(col("IMAFLAGS_ISO", np.zeros_like(x_arr)), dtype=float)
+
+    ra_arr = col("ALPHA_J2000")
+    dec_arr = col("DELTA_J2000")
+    if ra_arr is None or dec_arr is None:
+        ra_arr, dec_arr = wcs.pixel_to_world_values(x_arr, y_arr)
+    ra_arr = np.asarray(ra_arr, dtype=float)
+    dec_arr = np.asarray(dec_arr, dtype=float)
+
+    keep = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if imaflags_arr is not None:
+        keep &= np.asarray(imaflags_arr, dtype=float) == 0.0
+
+    if not np.any(keep):
+        raise RuntimeError("No sources detected after Gaia-mask filtering.")
+
+    out = {
+        "x": x_arr[keep],
+        "y": y_arr[keep],
+        "sma": sma_arr[keep],
+        "smi": smi_arr[keep],
+        "kron": kron_arr[keep],
+        "segment_flux": seg_flux_arr[keep],
+        "segment_area": seg_area_arr[keep],
+        "ra": ra_arr[keep],
+        "dec": dec_arr[keep],
+        "sex_flags": sex_flags_arr[keep],
+        "sex_imaflags_iso": imaflags_arr[keep],
+    }
+    debug_log(
+        "sextractor_done context=%s n_raw=%d n_kept=%d",
+        context,
+        int(len(x_arr)),
+        int(len(out["x"])),
+    )
+    return out
+
+
 def _compute_cutout_size(
     i: int,
     args: argparse.Namespace,
@@ -815,6 +1249,7 @@ def _run_pipeline_on_data(
     data: np.ndarray,
     wcs: WCS,
     err_map: np.ndarray | None,
+    detect_data: np.ndarray | None,
     args: argparse.Namespace,
     tmp_dir: Path,
     context: str = "mosaic",
@@ -832,19 +1267,12 @@ def _run_pipeline_on_data(
         tmp_dir,
     )
 
-    sigma_clip = SigmaClip(sigma=3.0, maxiters=5)
-    bkg = Background2D(
-        data,
-        box_size=(args.box_size, args.box_size),
-        filter_size=(args.filter_size, args.filter_size),
-        sigma_clip=sigma_clip,
-        bkg_estimator=MedianBackground(),
-    )
-    data_sub = data - bkg.background
-    threshold = args.nsigma * bkg.background_rms
-
-    kernel = Gaussian2DKernel(x_stddev=args.kernel_fwhm / 2.355)
-    smooth = convolve(data_sub, kernel, normalize_kernel=True)
+    if detect_data is None:
+        detect_data = data
+    elif detect_data.shape != data.shape:
+        raise RuntimeError(
+            f"Detection image shape {detect_data.shape} does not match measurement image shape {data.shape}"
+        )
 
     gaia_mask = None
     if args.exclude_gaia_stars:
@@ -866,51 +1294,103 @@ def _run_pipeline_on_data(
                 float(masked_px / gaia_mask.size),
             )
 
-    detect_kwargs = {}
-    if gaia_mask is not None and _supports_kwarg(detect_sources, "mask"):
-        detect_kwargs["mask"] = gaia_mask
-        segm = detect_sources(smooth, threshold, npixels=args.npixels, **detect_kwargs)
-    elif gaia_mask is not None:
-        smooth_for_detection = np.array(smooth, copy=True)
-        threshold_for_detection = np.array(threshold, copy=True)
-        smooth_for_detection[gaia_mask] = 0.0
-        threshold_for_detection[gaia_mask] = np.inf
-        segm = detect_sources(smooth_for_detection, threshold_for_detection, npixels=args.npixels)
-    else:
-        segm = detect_sources(smooth, threshold, npixels=args.npixels)
-
-    if segm is None:
-        raise RuntimeError("No sources detected.")
-    if args.deblend:
-        deblend_kwargs = {}
-        if gaia_mask is not None and _supports_kwarg(deblend_sources, "mask"):
-            deblend_kwargs["mask"] = gaia_mask
-        segm = deblend_sources(
-            smooth,
-            segm,
-            npixels=args.npixels,
-            nlevels=args.deblend_nlevels,
-            contrast=args.deblend_contrast,
-            **deblend_kwargs,
+    sex_flags_arr: np.ndarray | None = None
+    sex_imaflags_arr: np.ndarray | None = None
+    if str(getattr(args, "detection_engine", "sextractor")).lower() == "sextractor":
+        sex_cat = _sextractor_dual_image_catalog(
+            data=data,
+            detect_data=detect_data,
+            wcs=wcs,
+            gaia_mask=gaia_mask,
+            args=args,
+            tmp_dir=tmp_dir,
+            context=context,
         )
+        x_centroid = np.asarray(sex_cat["x"], dtype=float)
+        y_centroid = np.asarray(sex_cat["y"], dtype=float)
+        sma_arr = np.asarray(sex_cat["sma"], dtype=float)
+        smi_arr = np.asarray(sex_cat["smi"], dtype=float)
+        kron_arr = np.asarray(sex_cat["kron"], dtype=float)
+        seg_flux_arr = np.asarray(sex_cat["segment_flux"], dtype=float)
+        seg_area_arr = np.asarray(sex_cat["segment_area"], dtype=float)
+        ra_arr = np.asarray(sex_cat["ra"], dtype=float)
+        dec_arr = np.asarray(sex_cat["dec"], dtype=float)
+        sex_flags_arr = np.asarray(sex_cat.get("sex_flags"), dtype=float)
+        sex_imaflags_arr = np.asarray(sex_cat.get("sex_imaflags_iso"), dtype=float)
+    else:
+        if any(x is None for x in (Background2D, MedianBackground, SourceCatalog, detect_sources)):
+            raise RuntimeError(
+                "photutils detection engine requested but photutils is not installed."
+            )
+        sigma_clip = SigmaClip(sigma=3.0, maxiters=5)
+        bkg = Background2D(
+            data,
+            box_size=(args.box_size, args.box_size),
+            filter_size=(args.filter_size, args.filter_size),
+            sigma_clip=sigma_clip,
+            bkg_estimator=MedianBackground(),
+        )
+        data_sub = data - bkg.background
+        detect_bkg = Background2D(
+            detect_data,
+            box_size=(args.box_size, args.box_size),
+            filter_size=(args.filter_size, args.filter_size),
+            sigma_clip=sigma_clip,
+            bkg_estimator=MedianBackground(),
+        )
+        detect_data_sub = detect_data - detect_bkg.background
+        threshold = args.nsigma * detect_bkg.background_rms
 
-    cat = SourceCatalog(data_sub, segm, wcs=wcs, error=err_map)
-    x_centroid = to_float_array(cat.xcentroid)
-    y_centroid = to_float_array(cat.ycentroid)
-    sma_arr = to_float_array(cat.semimajor_sigma)
-    smi_arr = to_float_array(cat.semiminor_sigma)
-    kron_arr = to_float_array(cat.kron_radius)
-    seg_flux_arr = to_float_array(cat.segment_flux)
-    seg_area_arr = to_float_array(cat.segment_area)
-    sky = cat.sky_centroid
-    ra_arr = to_float_array(sky.ra.deg)
-    dec_arr = to_float_array(sky.dec.deg)
+        kernel = Gaussian2DKernel(x_stddev=args.kernel_fwhm / 2.355)
+        smooth = convolve(detect_data_sub, kernel, normalize_kernel=True)
+
+        detect_kwargs = {}
+        if gaia_mask is not None and _supports_kwarg(detect_sources, "mask"):
+            detect_kwargs["mask"] = gaia_mask
+            segm = detect_sources(smooth, threshold, npixels=args.npixels, **detect_kwargs)
+        elif gaia_mask is not None:
+            smooth_for_detection = np.array(smooth, copy=True)
+            threshold_for_detection = np.array(threshold, copy=True)
+            smooth_for_detection[gaia_mask] = 0.0
+            threshold_for_detection[gaia_mask] = np.inf
+            segm = detect_sources(smooth_for_detection, threshold_for_detection, npixels=args.npixels)
+        else:
+            segm = detect_sources(smooth, threshold, npixels=args.npixels)
+
+        if segm is None:
+            raise RuntimeError("No sources detected.")
+        if args.deblend:
+            deblend_kwargs = {}
+            if gaia_mask is not None and _supports_kwarg(deblend_sources, "mask"):
+                deblend_kwargs["mask"] = gaia_mask
+            segm = deblend_sources(
+                smooth,
+                segm,
+                npixels=args.npixels,
+                nlevels=args.deblend_nlevels,
+                contrast=args.deblend_contrast,
+                **deblend_kwargs,
+            )
+
+        cat = SourceCatalog(data_sub, segm, wcs=wcs, error=err_map)
+        x_centroid = to_float_array(cat.xcentroid)
+        y_centroid = to_float_array(cat.ycentroid)
+        sma_arr = to_float_array(cat.semimajor_sigma)
+        smi_arr = to_float_array(cat.semiminor_sigma)
+        kron_arr = to_float_array(cat.kron_radius)
+        seg_flux_arr = to_float_array(cat.segment_flux)
+        seg_area_arr = to_float_array(cat.segment_area)
+        sky = cat.sky_centroid
+        ra_arr = to_float_array(sky.ra.deg)
+        dec_arr = to_float_array(sky.dec.deg)
 
     debug_log(
-        "stage_detect_done context=%s n_sources=%d pixscale_arcsec=%.6f",
+        "stage_detect_done context=%s n_sources=%d pixscale_arcsec=%.6f detect_image=%s engine=%s",
         context,
         int(len(x_centroid)),
         float(pixscale_arcsec),
+        "stacked" if detect_data is not data else "input",
+        str(getattr(args, "detection_engine", "sextractor")),
     )
 
     psf_path = Path(args.psf)
@@ -970,6 +1450,14 @@ def _run_pipeline_on_data(
             "cutout_half_pix": float(cutout_half_sizes[i]),
             "cutout_size_pix": int(cutout_sizes[i]),
         }
+        if sex_flags_arr is not None and i < len(sex_flags_arr):
+            row["sex_flags"] = (
+                float(sex_flags_arr[i]) if np.isfinite(sex_flags_arr[i]) else np.nan
+            )
+        if sex_imaflags_arr is not None and i < len(sex_imaflags_arr):
+            row["sex_imaflags_iso"] = (
+                float(sex_imaflags_arr[i]) if np.isfinite(sex_imaflags_arr[i]) else np.nan
+            )
         if i < len(mfmtk_metrics):
             row.update(mfmtk_metrics[i])
         rows.append(row)
@@ -1020,8 +1508,33 @@ def _process_tile(
         wcs = wcs_full.slice((slice(y0, y1), slice(x0, x1)))
         err_map = _load_error_map(hdul, args, slice(y0, y1), slice(x0, x1))
 
+    detect_data = None
+    stack_paths = [Path(p) for p in getattr(args, "_detect_stack_paths", [])]
+    if stack_paths:
+        detect_data, used_stack_paths = _build_detection_stack_for_region(
+            stack_paths,
+            args,
+            slice(y0, y1),
+            slice(x0, x1),
+            context=tile_label,
+        )
+        if detect_data is None:
+            debug_log(
+                "detect_stack_fallback context=%s used_inputs=%d",
+                tile_label,
+                int(len(used_stack_paths)),
+            )
+
     tmp_dir = output_dir / "tmp_mfmtk" / f"tile_{tile['row']:02d}_{tile['col']:02d}"
-    df = _run_pipeline_on_data(data, wcs, err_map, args, tmp_dir, context=tile_label)
+    df = _run_pipeline_on_data(
+        data,
+        wcs,
+        err_map,
+        detect_data,
+        args,
+        tmp_dir,
+        context=tile_label,
+    )
 
     if not df.empty:
         df["x"] = pd.to_numeric(df["x"], errors="coerce") + float(tile["x0"])
@@ -1064,6 +1577,7 @@ def main() -> None:
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
+    input_path = input_path.expanduser().resolve()
 
     set_error_log_path(output_path.parent / "err.log")
     get_error_logger()
@@ -1081,6 +1595,17 @@ def main() -> None:
         int(args.mfmtk_workers),
         float(args.mfmtk_timeout),
     )
+
+    detect_stack_paths = _resolve_detection_stack_paths(input_path, args)
+    args._detect_stack_paths = [str(p) for p in detect_stack_paths]
+    if len(detect_stack_paths) > 1:
+        print(f"Using stacked detection image from {len(detect_stack_paths)} mosaics")
+        debug_log(
+            "detect_stack_paths %s",
+            ", ".join([p.name for p in detect_stack_paths]),
+        )
+    else:
+        debug_log("detect_stack_disabled_or_single input_only=%s", input_path.name)
 
     if args.tile_max and args.tile_max > 1 and args.mosaic_cutout and args.mosaic_cutout > 0:
         raise RuntimeError("--tile-max and --mosaic-cutout are mutually exclusive.")
@@ -1212,7 +1737,32 @@ def main() -> None:
         )
 
     tmp_dir = output_path.parent / "tmp_mfmtk"
-    df = _run_pipeline_on_data(data, wcs, err_map, args, tmp_dir, context="mosaic")
+    if args.mosaic_cutout and args.mosaic_cutout > 0:
+        detect_y_slice = slice(y1, y2)
+        detect_x_slice = slice(x1, x2)
+    else:
+        detect_y_slice = slice(0, int(data.shape[0]))
+        detect_x_slice = slice(0, int(data.shape[1]))
+
+    detect_data = None
+    if getattr(args, "_detect_stack_paths", None):
+        detect_data, used_stack_paths = _build_detection_stack_for_region(
+            [Path(p) for p in args._detect_stack_paths],
+            args,
+            detect_y_slice,
+            detect_x_slice,
+            context="mosaic",
+        )
+        if detect_data is None and len(args._detect_stack_paths) > 1:
+            print(
+                "Falling back to single-image detection (stacked detection image could not be built)."
+            )
+            debug_log(
+                "detect_stack_fallback context=mosaic used_inputs=%d",
+                int(len(used_stack_paths)),
+            )
+
+    df = _run_pipeline_on_data(data, wcs, err_map, detect_data, args, tmp_dir, context="mosaic")
     _write_catalog(df, output_path)
 
 
