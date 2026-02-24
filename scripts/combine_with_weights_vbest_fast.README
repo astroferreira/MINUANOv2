@@ -1,0 +1,97 @@
+Yes. Scientifically, combine_with_weights_vbest_fast.py is doing a weighted coaddition with optional robust outlier
+  rejection, and the “fast” changes mostly optimize how that same math is executed.
+
+  Core Science Model
+
+  - The script assumes each input has:
+      - SCI: science image values
+      - WHT: weight map (typically inverse variance)
+  - It computes the per-pixel weighted mean:
+      - SCI_out = sum_i (WHT_i * SCI_i) / sum_i (WHT_i)
+      - Implemented in streaming mode at combine_with_weights_vbest_fast.py:298 to combine_with_weights_vbest_fast.py:305
+  - It computes combined weight as:
+      - WHT_out = sum_i (WHT_i)
+      - This is the natural combination if WHT is inverse variance.
+  - It optionally computes error from weights:
+      - ERR_out = sqrt(1 / WHT_out) if --err-mode from-wht
+      - Implemented at combine_with_weights_vbest_fast.py:379 to combine_with_weights_vbest_fast.py:394
+
+  Why this is scientifically valid
+
+  - If WHT = 1 / sigma^2 (inverse variance), the weighted mean is the minimum-variance unbiased estimator under Gaussian
+    noise assumptions.
+  - Summing inverse variances is the correct error propagation for independent measurements.
+  - Pixels with invalid data are excluded by setting their weight to zero (not by changing SCI), which preserves the
+    estimator’s interpretation.
+
+  Data Quality / Masking Logic
+
+  - sanitize_sci_wht(...) (combine_with_weights_vbest_fast.py:196) defines what contributes to the coadd:
+      - WHT < --wht-floor can be zeroed (:214 to :216)
+      - non-positive weights are zeroed by default (:217 to :218)
+      - non-finite SCI or WHT are zeroed by default (:220 to :226)
+  - Scientifically, this means:
+      - bad pixels are excluded rather than contaminating sums
+      - missing coverage yields SCI=NaN (default) and ERR=NaN/Inf depending on mode
+
+  Optional Sigma Clipping (Robust Coaddition)
+
+  - In sigma-clip mode (--sigma-clip), it stacks all images and clips outliers along the stack axis per pixel location:
+      - combine_with_weights_vbest_fast.py:308 to combine_with_weights_vbest_fast.py:376
+  - Mechanism:
+      - sigma clip on SCI only (:355 to :357)
+      - clipped pixels get their weights set to 0 (:361 to :363)
+      - weighted mean is then recomputed from remaining values (:369 to :375)
+  - Scientifically, this is a robust estimator variant:
+      - helpful for cosmic rays/transients/bad residuals
+      - but changes the statistical estimator (not pure inverse-variance mean anymore)
+
+  What was changed for speed (and scientific impact)
+
+  1. Default internal math uses float32
+
+  - New option --accum-dtype {float32,float64} with default float32 (combine_with_weights_vbest_fast.py:126 to :133)
+  - Scientific impact:
+      - float32 is faster and lower memory
+      - may introduce slightly more rounding error in large coadds / high dynamic range
+      - use --accum-dtype float64 if precision is more important than speed
+
+  2. Memory mapping enabled by default
+
+  - --memmap default enabled, --no-memmap to disable (combine_with_weights_vbest_fast.py:135 to :145)
+  - Scientific impact:
+      - none on results
+      - only changes I/O behavior and memory pressure
+
+  3. Fewer temporary arrays during sanitization
+
+  - sanitize_sci_wht now builds one combined bad mask and zeros weights once (:211 to :226)
+  - Scientific impact:
+      - none (same masking policy, faster execution)
+
+  4. In-place arithmetic in streaming accumulation
+
+  - Uses reusable scratch and np.add/np.multiply(..., out=...) (combine_with_weights_vbest_fast.py:279 to :281, :298 to :300)
+  - Scientific impact:
+      - none in principle
+      - same weighted-sum math, fewer allocations
+
+  5. Sigma-clip path reduces temporary products
+
+  - Reuses sci_stack for weighted product (:370)
+  - Scientific impact:
+      - none in final estimator (same formula after clipping)
+      - destructive to the temporary stack only (intentional for speed)
+
+  Practical guidance
+
+  - Fastest scientifically reasonable default:
+      - no sigma clipping
+      - --accum-dtype float32
+      - memmap on (default)
+  - More conservative precision:
+      - --accum-dtype float64
+  - More robust against outliers (slower):
+      - --sigma-clip 3.0
+
+
