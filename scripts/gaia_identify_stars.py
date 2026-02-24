@@ -9,6 +9,16 @@ from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 from astroquery.gaia import Gaia
+import getpass
+
+#Force the archive to the central mirror 
+#Gaia.MAIN_GAIA_TABLE = "gaiadr3.gaia_source" 
+
+
+# Use this if you need higher quotas or private tables
+#user = "fferrari"
+#Gaia.login(user=user, password=getpass.getpass(f"Gaia password for {user}: "))
+
 
 
 def get_2d_wcs_and_shape(fits_path: str, ext: int | None):
@@ -154,7 +164,9 @@ def main():
 
     Gaia.ROW_LIMIT = args.row_limit
     query = build_adql_polygon(fp, args.table, args.cols, args.mag)
-    job = Gaia.launch_job_async(query)
+    #job = Gaia.launch_job_async(query)
+    # synchronous call
+    job = Gaia.launch_job(query)
     tab = job.get_results()
 
     if args.add_xy and len(tab) > 0:
