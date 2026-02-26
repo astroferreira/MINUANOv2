@@ -14,37 +14,97 @@ import numpy as np
 import pandas as pd
 from astropy.wcs import WCS
 
-# Slightly expand Gaia exclusion radii to better suppress stellar contamination.
+# Global multiplier applied after mag->radius conversion.
+# Larger value increases every Gaia mask (core + spikes) uniformly.
 GAIA_MASK_RADIUS_SCALE = 1.10
 
+# `jwst` template core size as a fraction of the per-star base radius.
+# Larger value makes the central hexagonal core bigger.
 GAIA_JWST_MASK_CORE_FRAC = 0.72
+# `jwst` template spike length as a fraction of the base radius.
+# Larger value makes all 6 spikes longer.
 GAIA_JWST_MASK_SPIKE_LENGTH_FRAC = 1.20
-GAIA_JWST_MASK_SPIKE_HALF_WIDTH_FRAC = 0.08
-GAIA_JWST_MASK_SPIKE_HALF_WIDTH_MIN_PIX = 1.5
+# `jwst` template spike half-width as a fraction of the base radius.
+# Larger value makes spikes thicker (for medium/large stars).
+GAIA_JWST_MASK_SPIKE_HALF_WIDTH_FRAC = 0.12
+# Minimum `jwst` spike half-width in pixels.
+# Increase this to thicken spikes for small/faint stars.
+GAIA_JWST_MASK_SPIKE_HALF_WIDTH_MIN_PIX = 2.0
 
 # Empirical axis/diagonal spike mask (recommended for COSMOS-Web style mosaics).
-GAIA_STAR_MASK_CORE_FRAC = 0.36
-GAIA_STAR_MASK_ARM_HALF_WIDTH_FRAC = 0.06
-GAIA_STAR_MASK_ARM_HALF_WIDTH_MIN_PIX = 1.0
+# Central circular core radius for star4/star8/star12, as fraction of base radius.
+# Larger value expands the round core before spikes start.
+GAIA_STAR_MASK_CORE_FRAC = 0.45
+# Arm half-width for star4/star8/star12, as fraction of base radius.
+# Main control for spike thickness on medium/large stars.
+GAIA_STAR_MASK_ARM_HALF_WIDTH_FRAC = 0.10
+# Minimum arm half-width in pixels for star4/star8/star12.
+# Increase this if small-star spikes look too thin.
+GAIA_STAR_MASK_ARM_HALF_WIDTH_MIN_PIX = 2.0
+# Axis-arm length (0/90/180/270 deg, and custom non-diagonal arms) as fraction of base radius.
+# Larger value makes spikes longer.
 GAIA_STAR_MASK_MAIN_ARM_LENGTH_FRAC = 1.10
+# Diagonal-arm length for `star8` only, as fraction of base radius.
+# Larger value extends the 45/135/225/315 deg spikes.
 GAIA_STAR_MASK_DIAG_ARM_LENGTH_FRAC = 0.80
+# Width scale for diagonal arms in `star8` relative to axis-arm width.
+# 1.0 means same thickness; smaller values make diagonal spikes thinner.
 GAIA_STAR_MASK_DIAG_ARM_WIDTH_SCALE = 0.75
 
 # Asymmetric horizontal arm scaling for the custom 30-degree template.
+# Extra multiplier for the 0-degree arm length in `star12`.
+# Increase to lengthen the rightward horizontal arm.
 GAIA_STAR_MASK_ARM_LENGTH_SCALE_0_DEG = 0.40
+# Extra multiplier for the 180-degree arm length in `star12`.
+# Increase to lengthen the leftward horizontal arm.
 GAIA_STAR_MASK_ARM_LENGTH_SCALE_180_DEG = 0.28
 
 # Custom 30-degree arm set requested for the mosaics.
+# Arm directions (degrees) used by `star12` mode.
+# Edit this list to change which spike directions are drawn.
 GAIA_STAR30_CUSTOM_ANGLES_DEG = [0.0, 30.0, 90.0, 150.0, 180.0, 210.0, 270.0, 330.0]
 
 # Non-linear size response: faint/small stars get larger cores but shorter arms,
 # while bright/large stars get longer arms.
+# Pivot (pixels) controlling where the faint->bright transition occurs.
+# Larger pivot delays the transition, affecting more stars as "faint/small".
 GAIA_STAR_MASK_NL_PIVOT_PIX = 18.0
+# Maximum multiplicative boost to the core size for faint/small stars.
+# Larger value makes faint-star cores puffier.
 GAIA_STAR_MASK_CORE_FAINT_SCALE_MAX = 1.75
+# Curve shape for faint-core boosting.
+# Larger value concentrates the core boost more strongly toward the faintest/smallest stars.
 GAIA_STAR_MASK_CORE_FAINT_GAMMA = 1.35
+# Minimum arm-length scale from the non-linear model (faint/small-star end).
+# Increase to avoid shortening faint-star spikes as much.
 GAIA_STAR_MASK_ARM_SCALE_MIN = 0.70
+# Maximum arm-length scale from the non-linear model (bright/large-star end).
+# Increase to lengthen spikes for bright/large stars.
 GAIA_STAR_MASK_ARM_SCALE_MAX = 1.25
+# Curve shape for arm-length scaling with brightness/size.
+# Larger value makes the bright-star arm extension kick in more gradually.
 GAIA_STAR_MASK_ARM_SCALE_GAMMA = 1.20
+
+# Tuning guide (quick presets / where to tweak):
+# - Thicker spikes (`star4`/`star8`/`star12`):
+#   increase `GAIA_STAR_MASK_ARM_HALF_WIDTH_FRAC` (large stars) and
+#   `GAIA_STAR_MASK_ARM_HALF_WIDTH_MIN_PIX` (small stars).
+# - Thicker spikes (`jwst`):
+#   increase `GAIA_JWST_MASK_SPIKE_HALF_WIDTH_FRAC` and/or
+#   `GAIA_JWST_MASK_SPIKE_HALF_WIDTH_MIN_PIX`.
+# - Longer spikes:
+#   increase `GAIA_STAR_MASK_MAIN_ARM_LENGTH_FRAC`, `GAIA_STAR_MASK_DIAG_ARM_LENGTH_FRAC`,
+#   or `GAIA_JWST_MASK_SPIKE_LENGTH_FRAC`.
+# - Bigger cores:
+#   increase `GAIA_STAR_MASK_CORE_FRAC` or `GAIA_JWST_MASK_CORE_FRAC`.
+# - More conservative masks overall:
+#   increase `GAIA_MASK_RADIUS_SCALE` (uniformly enlarges all masks).
+# - Make `star8` diagonal spikes less skinny:
+#   raise `GAIA_STAR_MASK_DIAG_ARM_WIDTH_SCALE` toward `1.0`.
+# - Preserve more area around faint stars (shorter/smaller masks):
+#   lower `GAIA_STAR_MASK_CORE_FAINT_SCALE_MAX` and/or lower `GAIA_MASK_RADIUS_SCALE`.
+# - More aggressive masking of bright stars:
+#   raise `GAIA_STAR_MASK_ARM_SCALE_MAX` and/or `GAIA_MASK_RADIUS_SCALE`.
 
 
 def _mag_to_radius_arcsec(
