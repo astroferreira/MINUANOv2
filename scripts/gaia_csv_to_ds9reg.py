@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Convert a source catalog CSV into a SAOImage DS9 region file.
 
-Expected columns by default: x, y, a, b, PAdeg
-where (x, y) are ellipse centers, (a, b) are semi-axes in pixels,
-and PAdeg is the ellipse position angle in degrees.
+Expected columns by default: xcentroid_pix, ycentroid_pix,
+sc_equivalent_radius, sc_elongation, sc_orientation.
+Here sc_equivalent_radius is used as semi-major axis ``a`` and
+sc_elongation is interpreted as ``b/a`` (so ``b = a * (b/a)``).
 """
 
 from __future__ import annotations
@@ -28,16 +29,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "output_reg",
         nargs="?",
-        default="catalog_source_extraction_mfmtk.reg",
-        help="Output DS9 region file path (default: catalog_source_extraction_mfmtk.reg)",
+        default=None,
+        help="Output DS9 region file path (default: input filename with .reg extension)",
     )
-    parser.add_argument("--x-col", default="x", help="Column name for x center")
-    parser.add_argument("--y-col", default="y", help="Column name for y center")
-    parser.add_argument("--a-col", default="a", help="Column name for semi-major axis")
-    parser.add_argument("--b-col", default="b", help="Column name for semi-minor axis")
+    parser.add_argument(
+        "--x-col", default="xcentroid_pix", help="Column name for x center"
+    )
+    parser.add_argument(
+        "--y-col", default="ycentroid_pix", help="Column name for y center"
+    )
+    parser.add_argument(
+        "--a-col",
+        default="sc_equivalent_radius",
+        help="Column name for semi-major axis a",
+    )
+    parser.add_argument(
+        "--ba-col",
+        default="sc_elongation",
+        help="Column name for axis ratio b/a (semi-minor over semi-major)",
+    )
     parser.add_argument(
         "--pa-col",
-        default="PAdeg",
+        default="sc_orientation",
         help="Column name for ellipse position angle in degrees",
     )
     return parser.parse_args()
@@ -56,13 +69,13 @@ def main() -> int:
     args = parse_args()
 
     input_path = Path(args.input_csv)
-    output_path = Path(args.output_reg)
+    output_path = Path(args.output_reg) if args.output_reg else input_path.with_suffix(".reg")
 
     if not input_path.exists():
         print(f"Error: input CSV not found: {input_path}", file=sys.stderr)
         return 1
 
-    required = [args.x_col, args.y_col, args.a_col, args.b_col, args.pa_col]
+    required = [args.x_col, args.y_col, args.a_col, args.ba_col, args.pa_col]
 
     count_written = 0
     count_skipped = 0
@@ -87,10 +100,13 @@ def main() -> int:
                     x = _to_float(row.get(args.x_col, ""))
                     y = _to_float(row.get(args.y_col, ""))
                     a = _to_float(row.get(args.a_col, ""))
-                    b = _to_float(row.get(args.b_col, ""))
+                    b_over_a = _to_float(row.get(args.ba_col, ""))
                     pa = _to_float(row.get(args.pa_col, ""))
-                    if a <= 0 or b <= 0:
-                        raise ValueError("semi-axis must be > 0")
+                    if a <= 0 or b_over_a <= 0:
+                        raise ValueError("semi-axis and axis ratio must be > 0")
+                    b = a * b_over_a
+                    # Catalog orientation is 90 deg offset from DS9's ellipse angle convention.
+                    pa = (pa + 90.0) % 180.0
                 except ValueError:
                     count_skipped += 1
                     continue

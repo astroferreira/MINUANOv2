@@ -243,8 +243,7 @@ def _stringify_value(value: object) -> object:
 
     if hasattr(value, "unit") and hasattr(value, "value"):
         base = getattr(value, "value")
-        unit = str(getattr(value, "unit"))
-        return f"{_stringify_value(base)} {unit}".strip()
+        return _stringify_value(base)
 
     if isinstance(value, (np.generic,)):
         return value.item()

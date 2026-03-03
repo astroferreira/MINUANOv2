@@ -1,0 +1,80 @@
+
+              _    _          
+ __ ___ _ __ | |__(_)_ _  ___ 
+/ _/ _ \ '  \| '_ \ | ' \/ -_)
+\__\___/_|_|_|_.__/_|_||_\___|
+
+ usage: combine_with_weights_vbest_fast.py [-h] [-o OUTPUT] [--pattern PATTERN] [--allow-nonpositive-wht]
+                                           [--wht-floor WHT_FLOOR] [--mask-nonfinite] [--no-mask-nonfinite]
+                                           [--sigma-clip SIGMA_CLIP] [--sigma-maxiters SIGMA_MAXITERS]
+                                           [--err-mode {from-wht,nan,inf,zero}] [--empty-sci {nan,zero}]
+                                           [--output-dtype {float32,float64}] [--accum-dtype {float32,float64}]
+                                           [--memmap] [--no-memmap] [--expect-n EXPECT_N] [--no-preserve-err-header]
+                                           inputs [inputs ...]
+
+$ python combine_with_weights_vbest_fast.py \
+        CWEB-F115W-0B_i2dnobg_small.fits CWEB-F150W-0B_i2dnobg_small.fits CWEB-F277W-0B_i2dnobg_small.fits CWEB-F444W-0B_i2dnobg_small.fits \
+        -o CWEB-coadd-0B_i2dnobg_small.fits
+
+OUTPUT produces CWEB-coadd-0A_i2dnobg_small.fits
+
+
+
+  _    _         _   _  __           _               
+ (_)__| |___ _ _| |_(_)/ _|_  _   __| |_ __ _ _ _ ___
+ | / _` / -_) ' \  _| |  _| || | (_-<  _/ _` | '_(_-<
+ |_\__,_\___|_||_\__|_|_|  \_, | /__/\__\__,_|_| /__/
+                           |__/                      
+
+ usage: gaia_identify_stars.py [-h] [--ext EXT] [--table TABLE] [--cols COLS] [--mag MAG] [--row-limit ROW_LIMIT]
+                               [--out OUT] [--add-xy] [--ds9-magcol DS9_MAGCOL] [--ds9-r0 DS9_R0]
+                               [--ds9-mag0 DS9_MAG0] [--ds9-minr DS9_MINR] [--ds9-maxr DS9_MAXR]
+                               [--ds9-color DS9_COLOR] [--ds9-width DS9_WIDTH] [--ds9-text]
+                               fits
+
+$ python gaia_identify_stars.py CWEB-coadd-0B_i2dnobg_small.fits
+
+OUTPUT CWEB-coadd-0B_i2dnobg_small_gaia.csv -- list of Gaia stars in the field
+OUTPUT CWEB-coadd-0B_i2dnobg_small_gaia.reg -- DS9 region file with stars positions and 'size'
+
+
+                 _                      _   
+ __ _ _ __ _ __| |_  _   _ __  __ _ __| |__
+/ _` | '_ \ '_ \ | || | | '  \/ _` (_-< / /
+\__,_| .__/ .__/_|\_, | |_|_|_\__,_/__/_\_\
+     |_|  |_|     |__/              
+
+usage: gaia_apply_mask_to_fits.py [-h] [--sci-ext SCI_EXT] [--gaia-ra-col GAIA_RA_COL] [--gaia-dec-col GAIA_DEC_COL]
+                                  [--gaia-mag-col GAIA_MAG_COL] [--gaia-r0 GAIA_R0] [--gaia-mag0 GAIA_MAG0]
+                                  [--gaia-minr GAIA_MINR] [--gaia-maxr GAIA_MAXR]
+                                  [--gaia-mask-shape {star12,star8,star4,jwst,circle}]
+                                  [--gaia-mask-rotation-deg GAIA_MASK_ROTATION_DEG]
+                                  [--gaia-mask-xshift-pix GAIA_MASK_XSHIFT_PIX]
+                                  [--gaia-mask-yshift-pix GAIA_MASK_YSHIFT_PIX] [--fill-value FILL_VALUE]
+                                  [--output OUTPUT]
+                                  fits_path gaia_csv
+
+$ python gaia_apply_mask_to_fits.py CWEB-coadd-0B_i2dnobg_small.fits CWEB-coadd-0B_i2dnobg_small_gaia.csv 
+
+OUTPUT  CWEB-coadd-0B_i2dnobg_small.gaia_masked.fits 
+
+
+
+    _     _          _                                
+ __| |___| |_ ___ __| |_   ___ ___ _  _ _ _ __ ___ ___
+/ _` / -_)  _/ -_) _|  _| (_-</ _ \ || | '_/ _/ -_|_-<
+\__,_\___|\__\___\__|\__| /__/\___/\_,_|_| \__\___/__/
+
+usage: detect_sources_fits.py [-h] [--hdu HDU] [--threshold-sigma THRESHOLD_SIGMA] [--npixels NPIXELS] [--connectivity {4,8}]
+                              [--smooth-fwhm SMOOTH_FWHM] [--no-smooth] [--segm-out SEGM_OUT]
+                              [--segm-dtype {auto,int16,int32}] [--basic-catalog-out BASIC_CATALOG_OUT]
+                              [--extended-catalog-out EXTENDED_CATALOG_OUT] [--merged-catalog-out MERGED_CATALOG_OUT]
+                              [--ds9-region-out DS9_REGION_OUT] [--jobs JOBS]
+                              fits_path
+
+
+python ../MINUANOv2/scripts/detect_sources_fits.py --threshold 3 --npixels 30 \
+        --merged-catalog-out CWEB-coadd-0B_i2dnobg_small.gaia_masked_fullcatalog.csv  \
+        CWEB-coadd-0B_i2dnobg_small.gaia_masked.fits
+
+OUTPUT  CWEB-coadd-0B_i2dnobg_small.gaia_masked_fullcatalog.csv   - full catalog with sources positions and properties
