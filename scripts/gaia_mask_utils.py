@@ -39,8 +39,8 @@ GAIA_STAR_MASK_CORE_FRAC = 0.45
 # Main control for spike thickness on medium/large stars.
 GAIA_STAR_MASK_ARM_HALF_WIDTH_FRAC = 0.10
 # Minimum arm half-width in pixels for star4/star8/star12.
-# Increase this if small-star spikes look too thin.
-GAIA_STAR_MASK_ARM_HALF_WIDTH_MIN_PIX = 2.0
+# Increase this if small-star spikes look too thin or under-cover the PSF wings.
+GAIA_STAR_MASK_ARM_HALF_WIDTH_MIN_PIX = 3.2
 # Axis-arm length (0/90/180/270 deg, and custom non-diagonal arms) as fraction of base radius.
 # Larger value makes spikes longer.
 GAIA_STAR_MASK_MAIN_ARM_LENGTH_FRAC = 1.10
@@ -71,13 +71,16 @@ GAIA_STAR30_CUSTOM_ANGLES_DEG = [0.0, 30.0, 90.0, 150.0, 180.0, 210.0, 270.0, 33
 GAIA_STAR_MASK_NL_PIVOT_PIX = 18.0
 # Maximum multiplicative boost to the core size for faint/small stars.
 # Larger value makes faint-star cores puffier.
-GAIA_STAR_MASK_CORE_FAINT_SCALE_MAX = 1.75
+GAIA_STAR_MASK_CORE_FAINT_SCALE_MAX = 2.45
 # Curve shape for faint-core boosting.
 # Larger value concentrates the core boost more strongly toward the faintest/smallest stars.
 GAIA_STAR_MASK_CORE_FAINT_GAMMA = 1.35
+# Maximum multiplicative boost to the base radius for faint/small stars.
+# At the faintest/smallest end this controls the overall mask footprint expansion.
+GAIA_STAR_MASK_RADIUS_FAINT_SCALE_MAX = 1.95
 # Minimum arm-length scale from the non-linear model (faint/small-star end).
 # Increase to avoid shortening faint-star spikes as much.
-GAIA_STAR_MASK_ARM_SCALE_MIN = 0.70
+GAIA_STAR_MASK_ARM_SCALE_MIN = 0.98
 # Maximum arm-length scale from the non-linear model (bright/large-star end).
 # Increase to lengthen spikes for bright/large stars.
 GAIA_STAR_MASK_ARM_SCALE_MAX = 1.25
@@ -171,10 +174,10 @@ def _jwst_diffraction_template_mask(
     return mask
 
 
-def _gaia_star_nonlinear_scales(radius_pix: float) -> tuple[float, float]:
+def _gaia_star_nonlinear_scales(radius_pix: float) -> tuple[float, float, float]:
     rr = float(radius_pix)
     if not (np.isfinite(rr) and rr > 0):
-        return 1.0, 1.0
+        return 1.0, 1.0, 1.0
 
     pivot = max(1.0e-6, float(GAIA_STAR_MASK_NL_PIVOT_PIX))
     bright_t = rr / (rr + pivot)
@@ -187,10 +190,13 @@ def _gaia_star_nonlinear_scales(radius_pix: float) -> tuple[float, float]:
     core_scale = 1.0 + (faint_t**core_faint_gamma) * (
         float(GAIA_STAR_MASK_CORE_FAINT_SCALE_MAX) - 1.0
     )
+    radius_scale = 1.0 + (faint_t**core_faint_gamma) * (
+        float(GAIA_STAR_MASK_RADIUS_FAINT_SCALE_MAX) - 1.0
+    )
     arm_scale = float(GAIA_STAR_MASK_ARM_SCALE_MIN) + (bright_t**arm_gamma) * (
         float(GAIA_STAR_MASK_ARM_SCALE_MAX) - float(GAIA_STAR_MASK_ARM_SCALE_MIN)
     )
-    return float(core_scale), float(arm_scale)
+    return float(core_scale), float(arm_scale), float(radius_scale)
 
 
 def _spike_arm_star_template_mask(
@@ -204,11 +210,12 @@ def _spike_arm_star_template_mask(
     if not (np.isfinite(rr) and rr > 0):
         return np.zeros_like(dx, dtype=bool)
 
-    core_scale, arm_scale = _gaia_star_nonlinear_scales(rr)
-    core_radius = max(1.0, float(GAIA_STAR_MASK_CORE_FRAC) * rr * core_scale)
+    core_scale, arm_scale, radius_scale = _gaia_star_nonlinear_scales(rr)
+    rr_eff = rr * radius_scale
+    core_radius = max(1.0, float(GAIA_STAR_MASK_CORE_FRAC) * rr_eff * core_scale)
     base_half_width = max(
         float(GAIA_STAR_MASK_ARM_HALF_WIDTH_MIN_PIX),
-        float(GAIA_STAR_MASK_ARM_HALF_WIDTH_FRAC) * rr,
+        float(GAIA_STAR_MASK_ARM_HALF_WIDTH_FRAC) * rr_eff,
     )
     rot = np.deg2rad(float(rotation_deg))
 
@@ -234,7 +241,7 @@ def _spike_arm_star_template_mask(
         is_diag = (mode_lc == "star8") and ((ang_deg % 90.0) != 0.0)
         arm_len = (
             (GAIA_STAR_MASK_DIAG_ARM_LENGTH_FRAC if is_diag else GAIA_STAR_MASK_MAIN_ARM_LENGTH_FRAC)
-            * rr
+            * rr_eff
         )
         if ang_deg == 0.0:
             arm_len *= float(GAIA_STAR_MASK_ARM_LENGTH_SCALE_0_DEG)
@@ -282,10 +289,11 @@ def _gaia_star_mask_extent_pix(radius_pix: float, args: argparse.Namespace) -> f
     if shape == "circle":
         return rr
     if shape in {"star12", "star8", "star4"}:
-        core_scale, arm_scale = _gaia_star_nonlinear_scales(rr)
+        core_scale, arm_scale, radius_scale = _gaia_star_nonlinear_scales(rr)
+        rr_eff = rr * radius_scale
         base_half_width = max(
             float(GAIA_STAR_MASK_ARM_HALF_WIDTH_MIN_PIX),
-            float(GAIA_STAR_MASK_ARM_HALF_WIDTH_FRAC) * rr,
+            float(GAIA_STAR_MASK_ARM_HALF_WIDTH_FRAC) * rr_eff,
         )
         max_half_width = base_half_width
         if shape == "star8":
@@ -294,19 +302,19 @@ def _gaia_star_mask_extent_pix(radius_pix: float, args: argparse.Namespace) -> f
                 base_half_width * float(GAIA_STAR_MASK_DIAG_ARM_WIDTH_SCALE),
             )
         max_len = max(
-            float(GAIA_STAR_MASK_MAIN_ARM_LENGTH_FRAC) * rr,
-            float(GAIA_STAR_MASK_DIAG_ARM_LENGTH_FRAC) * rr if shape == "star8" else 0.0,
+            float(GAIA_STAR_MASK_MAIN_ARM_LENGTH_FRAC) * rr_eff,
+            float(GAIA_STAR_MASK_DIAG_ARM_LENGTH_FRAC) * rr_eff if shape == "star8" else 0.0,
         )
         if shape == "star12":
             max_len = max(
                 max_len,
-                float(GAIA_STAR_MASK_MAIN_ARM_LENGTH_FRAC) * rr
+                float(GAIA_STAR_MASK_MAIN_ARM_LENGTH_FRAC) * rr_eff
                 * float(GAIA_STAR_MASK_ARM_LENGTH_SCALE_0_DEG),
-                float(GAIA_STAR_MASK_MAIN_ARM_LENGTH_FRAC) * rr
+                float(GAIA_STAR_MASK_MAIN_ARM_LENGTH_FRAC) * rr_eff
                 * float(GAIA_STAR_MASK_ARM_LENGTH_SCALE_180_DEG),
             )
         max_len *= arm_scale
-        core_radius = max(1.0, float(GAIA_STAR_MASK_CORE_FRAC) * rr * core_scale)
+        core_radius = max(1.0, float(GAIA_STAR_MASK_CORE_FRAC) * rr_eff * core_scale)
         return max(rr, core_radius + max_len + max_half_width)
 
     spike_half_width = max(

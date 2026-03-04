@@ -1,8 +1,11 @@
-	threshold	npix	nsources
+	threshold		npix	nsources
 	3			30	34870   median=0.00022299, std=0.00545197, threshold=0.0165789
 	3			50	24643   median=0.00022299, std=0.00545197, threshold=0.0165789
 	5			50	17414	median=0.00022299, std=0.00545197, threshold=0.0274828
-	5			30  22475   median=0.00022299, std=0.00545197, threshold=0.0274828
+	5			30  	22475   median=0.00022299, std=0.00545197, threshold=0.0274828
+
+	7			30  	17479   median=0.00022299, std=0.00545197, threshold=0.0383868
+	12			10	22246   median=0.00022299, std=0.00545197, threshold=0.0656466
 
 T/N    30   50
 3   34870	24643
