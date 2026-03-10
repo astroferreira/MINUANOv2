@@ -1,0 +1,24 @@
+1. Contar quantas linhas existem
+python download_euclid_mer_catalog.py --count
+
+2. Baixar só colunas úteis
+python download_euclid_mer_catalog.py \
+  --output euclid_mer_subset.csv \
+  --columns object_id,ra,dec,fwhm,flux_vis_psf,fluxerr_vis_psf,extended_prob,point_like_prob \
+  --chunk-size 100000
+
+
+
+3. Baixar tudo
+
+python download_euclid_mer_catalog.py \
+  --output euclid_mer_full.csv \
+  --all-columns \
+  --chunk-size 50000
+
+4. Baixar só fontes com detecção VIS
+python download_euclid_mer_catalog.py \
+  --output euclid_mer_vis.csv \
+  --columns object_id,ra,dec,fwhm,flux_vis_psf,fluxerr_vis_psf \
+  --where "flux_vis_psf > 0 AND fluxerr_vis_psf > 0" \
+  --chunk-size 100000
