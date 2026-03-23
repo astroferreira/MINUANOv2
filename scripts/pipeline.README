@@ -27,12 +27,15 @@ OUTPUT produces CWEB-coadd-0A_i2dnobg_small.fits
                            |__/                      
 
  usage: gaia_identify_stars.py [-h] [--ext EXT] [--table TABLE] [--cols COLS] [--mag MAG] [--row-limit ROW_LIMIT]
-                               [--out OUT] [--add-xy] [--ds9-magcol DS9_MAGCOL] [--ds9-r0 DS9_R0]
+                               [--allow-nonstellar] [--star-prob-min STAR_PROB_MIN] [--out OUT] [--add-xy] [--ds9-magcol DS9_MAGCOL] [--ds9-r0 DS9_R0]
                                [--ds9-mag0 DS9_MAG0] [--ds9-minr DS9_MINR] [--ds9-maxr DS9_MAXR]
                                [--ds9-color DS9_COLOR] [--ds9-width DS9_WIDTH] [--ds9-text]
                                fits
 
 $ python gaia_identify_stars.py CWEB-coadd-0B_i2dnobg_small.fits
+
+Default behavior: keep only Gaia DR3 sources classified as stars, excluding likely galaxies and QSOs.
+Use `--allow-nonstellar` to recover the old behavior.
 
 OUTPUT CWEB-coadd-0B_i2dnobg_small_gaia.csv -- list of Gaia stars in the field
 OUTPUT CWEB-coadd-0B_i2dnobg_small_gaia.reg -- DS9 region file with stars positions and 'size'

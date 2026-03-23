@@ -71,18 +71,90 @@ def footprint_polygon_icrs(w: WCS, nx: int, ny: int) -> np.ndarray:
         return np.vstack([sky.ra.deg, sky.dec.deg]).T
 
 
-def build_adql_polygon(fp_deg: np.ndarray, table: str, cols: str, mag_limit: float | None):
+GAIA_SOURCE_COLUMNS = {
+    "solution_id",
+    "designation",
+    "source_id",
+    "random_index",
+    "ref_epoch",
+    "ra",
+    "ra_error",
+    "dec",
+    "dec_error",
+    "parallax",
+    "parallax_error",
+    "pm",
+    "pmra",
+    "pmra_error",
+    "pmdec",
+    "pmdec_error",
+    "phot_g_mean_mag",
+    "phot_bp_mean_mag",
+    "phot_rp_mean_mag",
+    "bp_rp",
+    "radial_velocity",
+    "radial_velocity_error",
+    "ruwe",
+    "non_single_star",
+    "in_qso_candidates",
+    "in_galaxy_candidates",
+}
+
+GAIA_ASTROPHYS_COLUMNS = {
+    "classprob_dsc_combmod_star",
+    "classprob_dsc_combmod_galaxy",
+    "classprob_dsc_combmod_quasar",
+}
+
+
+def qualify_adql_columns(cols: str) -> str:
+    qualified: list[str] = []
+    for raw_col in cols.split(","):
+        col = raw_col.strip()
+        if not col:
+            continue
+        if "." in col or "(" in col or " " in col:
+            qualified.append(col)
+            continue
+        if col in GAIA_ASTROPHYS_COLUMNS:
+            qualified.append(f"ap.{col}")
+        elif col in GAIA_SOURCE_COLUMNS:
+            qualified.append(f"gs.{col}")
+        else:
+            qualified.append(col)
+    return ", ".join(qualified)
+
+
+def build_adql_polygon(
+    fp_deg: np.ndarray,
+    table: str,
+    cols: str,
+    mag_limit: float | None,
+    only_stars: bool,
+    star_prob_min: float,
+):
     # ADQL POLYGON: POLYGON('ICRS', ra1, dec1, ra2, dec2, ...)
     coords = ", ".join([f"{r:.12f}, {d:.12f}" for r, d in fp_deg])
     poly = f"POLYGON('ICRS', {coords})"
+    select_cols = qualify_adql_columns(cols)
 
-    where = f"CONTAINS(POINT('ICRS', ra, dec), {poly}) = 1"
+    where = f"CONTAINS(POINT('ICRS', gs.ra, gs.dec), {poly}) = 1"
     if mag_limit is not None:
-        where += f" AND phot_g_mean_mag <= {mag_limit}"
+        where += f" AND gs.phot_g_mean_mag <= {mag_limit}"
+    if only_stars:
+        where += f"""
+        AND ap.classprob_dsc_combmod_star IS NOT NULL
+        AND ap.classprob_dsc_combmod_galaxy IS NOT NULL
+        AND ap.classprob_dsc_combmod_quasar IS NOT NULL
+        AND ap.classprob_dsc_combmod_star >= {float(star_prob_min)}
+        AND ap.classprob_dsc_combmod_star > ap.classprob_dsc_combmod_galaxy
+        AND ap.classprob_dsc_combmod_star > ap.classprob_dsc_combmod_quasar
+        """
 
     query = f"""
-    SELECT {cols}
-    FROM {table}
+    SELECT {select_cols}
+    FROM {table} AS gs
+    JOIN gaiadr3.astrophysical_parameters AS ap USING (source_id)
     WHERE {where}
     """
     return query
@@ -138,11 +210,25 @@ def main():
     ap.add_argument("--table", default="gaiadr3.gaia_source", help="tabela Gaia (default: gaiadr3.gaia_source)")
     ap.add_argument(
         "--cols",
-        default="source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag",
+        default=(
+            "source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag, "
+            "classprob_dsc_combmod_star, classprob_dsc_combmod_galaxy, classprob_dsc_combmod_quasar"
+        ),
         help="colunas ADQL"
     )
     ap.add_argument("--mag", type=float, default=None, help="corte em G (phot_g_mean_mag <= mag)")
     ap.add_argument("--row-limit", type=int, default=200000, help="limite de linhas (segurança)")
+    ap.add_argument(
+        "--allow-nonstellar",
+        action="store_true",
+        help="desliga o filtro de classe e retorna qualquer fonte Gaia no footprint",
+    )
+    ap.add_argument(
+        "--star-prob-min",
+        type=float,
+        default=0.8,
+        help="probabilidade minima em classprob_dsc_combmod_star para aceitar a fonte como estrela (default: 0.8)",
+    )
 
     ap.add_argument("--out", default=None, help="arquivo CSV de saída (default: <fits>_gaia.csv)")
     ap.add_argument("--add-xy", action="store_true", help="adiciona x,y (pixels) via WCS ao CSV")
@@ -163,7 +249,14 @@ def main():
     fp = footprint_polygon_icrs(w, nx, ny)
 
     Gaia.ROW_LIMIT = args.row_limit
-    query = build_adql_polygon(fp, args.table, args.cols, args.mag)
+    query = build_adql_polygon(
+        fp,
+        args.table,
+        args.cols,
+        args.mag,
+        only_stars=not args.allow_nonstellar,
+        star_prob_min=args.star_prob_min,
+    )
     #job = Gaia.launch_job_async(query)
     # synchronous call
     job = Gaia.launch_job(query)
